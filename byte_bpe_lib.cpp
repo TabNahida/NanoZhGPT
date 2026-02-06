@@ -933,7 +933,7 @@ bool write_tokenizer_json(const std::string &path, const Config &cfg, const std:
     out << "\"pre_tokenizer\":{";
     out << "\"type\":\"ByteLevel\",";
     out << "\"add_prefix_space\":false,";
-    out << "\"use_regex\":false";
+    out << "\"trim_offsets\":true";
     out << "},";
     out << "\"post_processor\":null,";
     out << "\"decoder\":{";
