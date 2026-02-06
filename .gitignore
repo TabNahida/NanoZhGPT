@@ -1,2 +1,9 @@
 .env
 */__pycache__/
+/dataset_cache
+/.xmake
+/.cache
+/.vscode
+/build
+compile_commands.json
+/chunks
