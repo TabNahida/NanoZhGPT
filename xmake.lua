@@ -2,7 +2,7 @@ set_project("NanoZhGPT_Tokenizer")
 set_version("0.1.0")
 
 add_rules("mode.debug", "mode.release")
-set_languages("c++17")
+set_languages("c++23")
 
 add_requires("zlib")
 
