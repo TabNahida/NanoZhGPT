@@ -491,6 +491,18 @@ def fmt_eta(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{sec:02d}"
 
 
+def to_basic_types(obj):
+    if isinstance(obj, dict):
+        return {k: to_basic_types(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [to_basic_types(v) for v in obj]
+    if isinstance(obj, tuple):
+        return [to_basic_types(v) for v in obj]
+    if isinstance(obj, Path):
+        return str(obj)
+    return obj
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train a ~100M GPT on XPU/CUDA/CPU using token shards.")
     p.add_argument("--data-dir", type=Path, default=Path("data/tokens"))
@@ -645,7 +657,7 @@ def main() -> None:
     best_val = float("inf")
 
     if args.resume is not None and args.resume.exists():
-        ckpt = torch.load(args.resume, map_location="cpu")
+        ckpt = torch.load(args.resume, map_location="cpu", weights_only=False)
         unwrap_model(model).load_state_dict(ckpt["model"], strict=True)
         optimizer.load_state_dict(ckpt["optimizer"])
         iter_num = int(ckpt.get("iter_num", 0))
@@ -845,7 +857,7 @@ def main() -> None:
                     "iter_num": iter_num,
                     "best_val": best_val,
                     "model_config": asdict(cfg),
-                    "train_args": vars(args),
+                    "train_args": to_basic_types(vars(args)),
                 }
                 ckpt_path = args.out_dir / f"ckpt_{iter_num:06d}.pt"
                 torch.save(ckpt, ckpt_path)
@@ -859,7 +871,7 @@ def main() -> None:
                 "iter_num": iter_num,
                 "best_val": best_val,
                 "model_config": asdict(cfg),
-                "train_args": vars(args),
+                "train_args": to_basic_types(vars(args)),
             }
             torch.save(ckpt, last)
             print(f"training done. final checkpoint: {last}")
