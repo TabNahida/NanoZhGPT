@@ -16,7 +16,7 @@ A tiny Chinese GPT implementation
 
 ### 1) Prepare token shards (json/json.gz -> binary)
 ```powershell
-python train/prepare_shards.py `
+xmake run prepare_shards -- `
   --env-file .env `
   --tokenizer tokenizer.json `
   --out-dir data/tokens `
