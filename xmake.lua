@@ -15,13 +15,3 @@ target("byte_bpe_train")
     )
     set_rundir("$(projectdir)")
     add_packages("zlib")
-
-target("prepare_shards")
-    set_kind("binary")
-    add_files(
-        "tokenizer/prepare_shards.cpp",
-        "tokenizer/byte_bpe_lib.cpp"
-    )
-    set_rundir("$(projectdir)")
-    add_packages("zlib")
-    
