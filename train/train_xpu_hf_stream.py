@@ -1,16 +1,14 @@
 #!/usr/bin/env python
 import argparse
-import json
 import math
 import os
-import itertools
 import queue as pyqueue
 import threading
 import time
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -19,6 +17,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint_utils
 from torch.nn.parallel import DistributedDataParallel as DDP
+
+try:
+    from datasets import load_dataset
+except ImportError:
+    load_dataset = None
+
+try:
+    from tokenizers import Tokenizer
+except ImportError:
+    Tokenizer = None
 
 
 @dataclass
@@ -140,315 +148,246 @@ class GPT(nn.Module):
         return logits, loss
 
 
-class TokenShardSampler:
+class HFStreamTokenSampler:
     def __init__(
         self,
-        data_dir: Path,
+        tokenizer_path: Path,
+        dataset_name: str,
+        dataset_config: Optional[str],
         split: str,
+        text_field: str,
         seq_len: int,
-        val_ratio: float,
-        shards_per_batch: int = 1,
-        contiguous_batch: bool = True,
-        ram_cache_gb: float = 0.0,
+        seed: int,
+        rank: int,
+        world_size: int,
+        encode_batch_size: int = 256,
+        shuffle_buffer: int = 10_000,
+        min_chars: int = 1,
+        max_chars: int = 20_000,
+        bos_token: Optional[str] = None,
+        eos_token: Optional[str] = "</s>",
+        random_sample: bool = False,
+        stream_buffer_tokens: int = 1_000_000,
     ) -> None:
-        meta = json.loads((data_dir / "meta.json").read_text(encoding="utf-8"))
-        self.dtype = np.dtype(meta["dtype"])
-        all_shards = list(meta["shards"])
-        if not all_shards:
-            raise ValueError("no shards in meta.json")
-        split_shards = self._split_shards(all_shards, split, val_ratio)
-        self.arrays: List[np.ndarray] = []
-        self.lengths: List[int] = []
-        self.max_starts: List[int] = []
-        self.shards_per_batch = max(1, int(shards_per_batch))
-        self.contiguous_batch = bool(contiguous_batch)
-        self.ram_budget_bytes = int(max(0.0, ram_cache_gb) * (1024**3))
+        if load_dataset is None:
+            raise ImportError("datasets is required. Install with: pip install datasets")
+        if Tokenizer is None:
+            raise ImportError("tokenizers is required. Install with: pip install tokenizers")
+
+        self.tokenizer = Tokenizer.from_file(str(tokenizer_path))
+        self.vocab_size = int(self.tokenizer.get_vocab_size())
+
+        self.dataset_name = dataset_name
+        self.dataset_config = dataset_config
+        self.split = split
+        self.text_field = text_field
+        self.seq_len = int(seq_len)
+        self.seed = int(seed)
+        self.rank = int(rank)
+        self.world_size = int(world_size)
+        self.encode_batch_size = max(1, int(encode_batch_size))
+        self.shuffle_buffer = max(0, int(shuffle_buffer))
+        self.min_chars = max(0, int(min_chars))
+        self.max_chars = int(max_chars)
+        self.random_sample = bool(random_sample)
+        self.stream_buffer_tokens = max(
+            int(stream_buffer_tokens), self.seq_len * self.encode_batch_size + 1
+        )
+        self.rng = np.random.default_rng(self.seed + self.rank + (0 if split == "train" else 10_000))
+
+        self.bos_id = self.tokenizer.token_to_id(bos_token) if bos_token else None
+        self.eos_id = self.tokenizer.token_to_id(eos_token) if eos_token else None
+        if bos_token and self.bos_id is None:
+            raise ValueError(f"bos token {bos_token!r} not found in tokenizer")
+        if eos_token and self.eos_id is None:
+            raise ValueError(f"eos token {eos_token!r} not found in tokenizer")
+
+        self.docs_seen = 0
+        self.tokens_seen = 0
         self.cached_bytes = 0
         self.total_bytes = 0
-        for item in split_shards:
-            p = data_dir / item["file"]
-            arr = np.memmap(p, dtype=self.dtype, mode="r")
-            max_start = int(arr.shape[0]) - seq_len - 1
-            if max_start > 0:
-                shard_bytes = int(arr.nbytes)
-                self.total_bytes += shard_bytes
-                if self.cached_bytes + shard_bytes <= self.ram_budget_bytes:
-                    arr = np.asarray(arr, dtype=self.dtype).copy()
-                    self.cached_bytes += shard_bytes
-                self.arrays.append(arr)
-                self.lengths.append(int(arr.shape[0]))
-                self.max_starts.append(max_start)
-        if not self.arrays:
-            raise ValueError(f"split={split} has no shard with enough tokens for seq_len={seq_len}")
-        weights = np.asarray(self.max_starts, dtype=np.float64)
-        self.probs = weights / weights.sum()
-        self.seq_len = seq_len
-        self.rng = np.random.default_rng()
 
-    @staticmethod
-    def _split_shards(
-        shards: Sequence[Dict[str, int]], split: str, val_ratio: float
-    ) -> Sequence[Dict[str, int]]:
-        if split not in {"train", "val"}:
-            raise ValueError(f"invalid split: {split}")
-        if val_ratio <= 0.0 or len(shards) < 2:
-            return shards if split == "train" else []
-        n_val = int(len(shards) * val_ratio)
-        n_val = max(1, n_val)
-        n_val = min(n_val, len(shards) - 1)
-        if split == "train":
-            return shards[:-n_val]
-        return shards[-n_val:]
+        init_cap = max(self.stream_buffer_tokens * 2, self.seq_len + 2)
+        self._buffer = np.empty(init_cap, dtype=np.int32)
+        self._buf_start = 0
+        self._buf_end = 0
 
-    def _sample_from_shard(self, shard_idx: int, count: int) -> Tuple[np.ndarray, np.ndarray]:
-        arr = self.arrays[shard_idx]
-        arr_len = self.lengths[shard_idx]
-        out_x = np.empty((count, self.seq_len), dtype=np.int64)
-        out_y = np.empty((count, self.seq_len), dtype=np.int64)
+        self._epoch = 0
+        self._stream = None
+        self._iterator = None
+        self._reset_stream()
 
-        # Prefer one contiguous window per shard to reduce random small reads.
-        needed = count * (self.seq_len + 1)
-        if self.contiguous_batch and count > 1 and needed <= arr_len:
-            base_max = arr_len - needed
-            base = int(self.rng.integers(0, base_max + 1))
-            flat = np.asarray(arr[base : base + needed], dtype=np.int64)
-            block = flat.reshape(count, self.seq_len + 1)
-            out_x[:, :] = block[:, :-1]
-            out_y[:, :] = block[:, 1:]
-            return out_x, out_y
+    def _build_stream(self, epoch: int):
+        ds = load_dataset(
+            path=self.dataset_name,
+            name=self.dataset_config,
+            split=self.split,
+            streaming=True,
+        )
+        if self.world_size > 1:
+            ds = ds.shard(num_shards=self.world_size, index=self.rank)
+        if self.split == "train" and self.shuffle_buffer > 0:
+            ds = ds.shuffle(seed=self.seed + epoch + self.rank, buffer_size=self.shuffle_buffer)
+        return ds
 
-        starts = self.rng.integers(0, self.max_starts[shard_idx] + 1, size=count, dtype=np.int64)
+    def _reset_stream(self) -> None:
+        self._stream = self._build_stream(self._epoch)
+        self._iterator = iter(self._stream)
+        self._epoch += 1
+
+    def _next_record(self) -> Dict[str, object]:
+        while True:
+            try:
+                row = next(self._iterator)
+                if isinstance(row, dict):
+                    return row
+            except StopIteration:
+                self._reset_stream()
+
+    def _collect_texts(self) -> List[str]:
+        texts: List[str] = []
+        scanned = 0
+        scan_limit = max(10_000, self.encode_batch_size * 200)
+        while len(texts) < self.encode_batch_size:
+            row = self._next_record()
+            scanned += 1
+            text = row.get(self.text_field)
+            if not isinstance(text, str):
+                if scanned >= scan_limit and not texts:
+                    raise ValueError(f"no valid text found in field={self.text_field!r}")
+                continue
+            if self.min_chars > 0 and len(text) < self.min_chars:
+                if scanned >= scan_limit and not texts:
+                    raise ValueError(f"text in field={self.text_field!r} failed min_chars={self.min_chars}")
+                continue
+            if self.max_chars > 0 and len(text) > self.max_chars:
+                text = text[: self.max_chars]
+            if text:
+                texts.append(text)
+        if not texts:
+            raise ValueError("stream returned no texts for tokenization")
+        return texts
+
+    def _available_tokens(self) -> int:
+        return self._buf_end - self._buf_start
+
+    def _ensure_capacity(self, extra_tokens: int) -> None:
+        needed = self._available_tokens() + extra_tokens
+        if needed <= self._buffer.size - self._buf_start:
+            return
+
+        if self._buf_start > 0:
+            remaining = self._available_tokens()
+            self._buffer[:remaining] = self._buffer[self._buf_start : self._buf_end]
+            self._buf_start = 0
+            self._buf_end = remaining
+            if needed <= self._buffer.size:
+                return
+
+        new_cap = self._buffer.size
+        while new_cap < needed:
+            new_cap *= 2
+        new_buffer = np.empty(new_cap, dtype=self._buffer.dtype)
+        remaining = self._available_tokens()
+        new_buffer[:remaining] = self._buffer[self._buf_start : self._buf_end]
+        self._buffer = new_buffer
+        self._buf_start = 0
+        self._buf_end = remaining
+
+    def _append_encoded_batch(self, texts: List[str]) -> None:
+        encoded = self.tokenizer.encode_batch(texts)
+        extra = int(self.bos_id is not None) + int(self.eos_id is not None)
+        total_new = sum(len(item.ids) + extra for item in encoded)
+        if total_new <= 0:
+            return
+
+        self._ensure_capacity(total_new)
+        cursor = self._buf_end
+        for item in encoded:
+            ids = item.ids
+            if self.bos_id is not None:
+                self._buffer[cursor] = self.bos_id
+                cursor += 1
+            if ids:
+                n = len(ids)
+                self._buffer[cursor : cursor + n] = np.asarray(ids, dtype=np.int32)
+                cursor += n
+            if self.eos_id is not None:
+                self._buffer[cursor] = self.eos_id
+                cursor += 1
+            self.docs_seen += 1
+
+        added = cursor - self._buf_end
+        self._buf_end = cursor
+        self.tokens_seen += int(added)
+
+    def _refill(self, min_tokens: int) -> None:
+        target = max(int(min_tokens), self.stream_buffer_tokens)
+        while self._available_tokens() < target:
+            texts = self._collect_texts()
+            self._append_encoded_batch(texts)
+
+    def _compact_if_needed(self) -> None:
+        if self._buf_start == 0:
+            return
+        remaining = self._available_tokens()
+        if self._buf_start < (self._buffer.size // 2) and remaining >= self.seq_len * 4:
+            return
+        self._buffer[:remaining] = self._buffer[self._buf_start : self._buf_end]
+        self._buf_start = 0
+        self._buf_end = remaining
+
+    def _sample_random(self, batch_size: int) -> Tuple[np.ndarray, np.ndarray]:
+        needed = self.seq_len + 1
+        self._refill(needed + batch_size * self.seq_len)
+        avail = self._available_tokens()
+        max_start = avail - self.seq_len - 1
+        if max_start <= 0:
+            return self._sample_contiguous(batch_size)
+
+        starts = self.rng.integers(0, max_start + 1, size=batch_size, dtype=np.int64)
         starts.sort()
-        for i, start in enumerate(starts):
-            chunk = np.asarray(arr[int(start) : int(start) + self.seq_len + 1], dtype=np.int64)
-            out_x[i, :] = chunk[:-1]
-            out_y[i, :] = chunk[1:]
-        return out_x, out_y
+        x = np.empty((batch_size, self.seq_len), dtype=np.int64)
+        y = np.empty((batch_size, self.seq_len), dtype=np.int64)
+        base = self._buf_start
+        for i, s in enumerate(starts):
+            st = base + int(s)
+            chunk = self._buffer[st : st + self.seq_len + 1]
+            x[i, :] = chunk[:-1]
+            y[i, :] = chunk[1:]
+
+        advance = min(batch_size * self.seq_len, max(0, avail - (self.seq_len + 1)))
+        self._buf_start += int(advance)
+        self._compact_if_needed()
+        return x, y
+
+    def _sample_contiguous(self, batch_size: int) -> Tuple[np.ndarray, np.ndarray]:
+        needed = batch_size * self.seq_len + 1
+        self._refill(needed)
+        start = self._buf_start
+        end = start + needed
+        flat = np.asarray(self._buffer[start:end], dtype=np.int64)
+        x = flat[:-1].reshape(batch_size, self.seq_len)
+        y = flat[1:].reshape(batch_size, self.seq_len)
+        self._buf_start += batch_size * self.seq_len
+        self._compact_if_needed()
+        return x, y
 
     def sample_batch_arrays(self, batch_size: int) -> Tuple[np.ndarray, np.ndarray]:
         batch_size = int(batch_size)
-        x = np.empty((batch_size, self.seq_len), dtype=np.int64)
-        y = np.empty((batch_size, self.seq_len), dtype=np.int64)
-
-        shards_per_batch = min(self.shards_per_batch, batch_size, len(self.arrays))
-        selected = self.rng.choice(
-            len(self.arrays),
-            size=shards_per_batch,
-            replace=False if shards_per_batch <= len(self.arrays) else True,
-            p=self.probs,
-        )
-        counts = np.full(shards_per_batch, batch_size // shards_per_batch, dtype=np.int64)
-        counts[: batch_size % shards_per_batch] += 1
-
-        cursor = 0
-        for i, shard_idx in enumerate(selected):
-            c = int(counts[i])
-            if c <= 0:
-                continue
-            sx, sy = self._sample_from_shard(int(shard_idx), c)
-            x[cursor : cursor + c, :] = sx
-            y[cursor : cursor + c, :] = sy
-            cursor += c
-
-        if shards_per_batch > 1:
-            perm = self.rng.permutation(batch_size)
-            x = x[perm]
-            y = y[perm]
-        return x, y
+        if batch_size <= 0:
+            raise ValueError(f"invalid batch size: {batch_size}")
+        if self.random_sample:
+            return self._sample_random(batch_size)
+        return self._sample_contiguous(batch_size)
 
     def sample_batch(self, batch_size: int) -> Tuple[torch.Tensor, torch.Tensor]:
         x, y = self.sample_batch_arrays(batch_size)
         return torch.from_numpy(x), torch.from_numpy(y)
 
 
-
-def _require_pkg(pkg: str, extra: str = ""):
-    try:
-        __import__(pkg)
-    except Exception as e:
-        hint = f"Please install '{pkg}' (pip install {pkg})"
-        if extra:
-            hint += f" and {extra}"
-        raise RuntimeError(hint) from e
-
-
-class HFStreamingTokenSampler:
-    """Stream tokens from a Hugging Face dataset (datasets.load_dataset(..., streaming=True)).
-
-    This sampler packs a continuous token stream into fixed-length sequences of (seq_len + 1),
-    then returns (x, y) pairs where y is the next-token shift of x.
-
-    Expected dataset format:
-      - Prefer a pre-tokenized field (default: input_ids) containing a list[int].
-      - Alternatively, provide --hf-text-field + --hf-tokenizer to tokenize on-the-fly (requires transformers).
-    """
-
-    def __init__(
-        self,
-        dataset: str,
-        name: Optional[str],
-        split: str,
-        seq_len: int,
-        token_field: str = "input_ids",
-        text_field: str = "text",
-        tokenizer_name_or_path: Optional[str] = None,
-        shuffle_buffer: int = 0,
-        seed: int = 42,
-        rank: int = 0,
-        world_size: int = 1,
-        cache_dir: Optional[Path] = None,
-        trust_remote_code: bool = False,
-    ) -> None:
-        _require_pkg("datasets")
-        self.dataset = dataset
-        self.name = name
-        self.split = split
-        self.seq_len = int(seq_len)
-        self.token_field = str(token_field)
-        self.text_field = str(text_field)
-        self.tokenizer_name_or_path = tokenizer_name_or_path
-        self.shuffle_buffer = int(max(0, shuffle_buffer))
-        self.seed = int(seed)
-        self.rank = int(rank)
-        self.world_size = int(max(1, world_size))
-        self.cache_dir = cache_dir
-        self.trust_remote_code = bool(trust_remote_code)
-
-        self._tokenizer = None
-        self._tok_buf: List[int] = []
-        self._buf_pos = 0
-        self._trim_threshold = 1_000_000  # tokens
-
-        self._manual_mod_shard = False
-        self._build_stream()
-        self._reset_iter()
-
-    def _build_stream(self) -> None:
-        from datasets import load_dataset
-
-        kwargs = dict(split=self.split, streaming=True)
-        if self.name:
-            kwargs["name"] = self.name
-        if self.cache_dir is not None:
-            kwargs["cache_dir"] = str(self.cache_dir)
-        # datasets.load_dataset supports trust_remote_code in newer versions; safe to pass only if present.
-        try:
-            ds = load_dataset(self.dataset, **kwargs, trust_remote_code=self.trust_remote_code)
-        except TypeError:
-            ds = load_dataset(self.dataset, **kwargs)
-
-        if self.shuffle_buffer > 0 and hasattr(ds, "shuffle"):
-            ds = ds.shuffle(buffer_size=self.shuffle_buffer, seed=self.seed)
-
-        # DDP sharding: prefer native node split/shard when available (fast, no wasted reads).
-        if self.world_size > 1:
-            try:
-                from datasets.distributed import split_dataset_by_node
-
-                ds = split_dataset_by_node(ds, world_size=self.world_size, rank=self.rank)
-            except Exception:
-                if hasattr(ds, "shard"):
-                    try:
-                        ds = ds.shard(num_shards=self.world_size, index=self.rank, contiguous=True)
-                    except TypeError:
-                        ds = ds.shard(num_shards=self.world_size, index=self.rank)
-                else:
-                    # Last resort fallback: manual modulo shard in the iterator (may waste reads).
-                    self._manual_mod_shard = True
-
-        self._stream = ds
-
-    def _iter_examples(self):
-        if not self._manual_mod_shard or self.world_size <= 1:
-            yield from self._stream
-            return
-        # Manual modulo sharding fallback
-        for i, ex in enumerate(self._stream):
-            if (i % self.world_size) == self.rank:
-                yield ex
-
-    def _reset_iter(self) -> None:
-        self._it = iter(self._iter_examples())
-
-    def _get_tokenizer(self):
-        if self._tokenizer is not None:
-            return self._tokenizer
-        if self.tokenizer_name_or_path is None:
-            raise RuntimeError(
-                "Dataset example has no token field and no tokenizer was provided. "
-                "Provide --hf-token-field for pre-tokenized datasets, or --hf-tokenizer to tokenize text."
-            )
-        _require_pkg("transformers", extra="'transformers' (pip install transformers)")
-        from transformers import AutoTokenizer
-
-        self._tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_name_or_path, use_fast=True)
-        return self._tokenizer
-
-    def _extract_tokens(self, ex: Dict) -> List[int]:
-        if self.token_field in ex and ex[self.token_field] is not None:
-            toks = ex[self.token_field]
-            if isinstance(toks, (list, tuple, np.ndarray)):
-                # Some datasets store batched tokens (list[list[int]]); flatten conservatively.
-                if len(toks) > 0 and isinstance(toks[0], (list, tuple, np.ndarray)):
-                    flat: List[int] = []
-                    for row in toks:
-                        flat.extend(int(t) for t in row)
-                    return flat
-                return [int(t) for t in toks]
-            # Single scalar token id
-            return [int(toks)]
-
-        if self.text_field in ex and ex[self.text_field] is not None:
-            tok = self._get_tokenizer()
-            ids = tok(str(ex[self.text_field]), add_special_tokens=False)["input_ids"]
-            return [int(t) for t in ids]
-
-        keys = ", ".join(sorted(ex.keys()))
-        raise KeyError(
-            f"Example has neither token_field='{self.token_field}' nor text_field='{self.text_field}'. "
-            f"Available keys: {keys}"
-        )
-
-    def _append_tokens(self, toks: List[int]) -> None:
-        self._tok_buf.extend(toks)
-        # Trim occasionally to avoid unbounded growth when using pointer slicing.
-        if self._buf_pos > self._trim_threshold:
-            self._tok_buf = self._tok_buf[self._buf_pos :]
-            self._buf_pos = 0
-
-    def _ensure(self, n: int) -> None:
-        while (len(self._tok_buf) - self._buf_pos) < n:
-            try:
-                ex = next(self._it)
-            except StopIteration:
-                self._reset_iter()
-                ex = next(self._it)
-            toks = self._extract_tokens(ex)
-            if toks:
-                self._append_tokens(toks)
-
-    def _take(self, n: int) -> List[int]:
-        self._ensure(n)
-        s = self._buf_pos
-        e = s + n
-        chunk = self._tok_buf[s:e]
-        self._buf_pos = e
-        return chunk
-
-    def sample_batch_arrays(self, batch_size: int) -> Tuple[np.ndarray, np.ndarray]:
-        batch_size = int(batch_size)
-        x = np.empty((batch_size, self.seq_len), dtype=np.int64)
-        y = np.empty((batch_size, self.seq_len), dtype=np.int64)
-        need = self.seq_len + 1
-        for i in range(batch_size):
-            chunk = self._take(need)
-            arr = np.asarray(chunk, dtype=np.int64)
-            x[i, :] = arr[:-1]
-            y[i, :] = arr[1:]
-        return x, y
-
 class BatchPrefetcher:
-    def __init__(self, sampler: TokenShardSampler, batch_size: int, prefetch_batches: int) -> None:
+    def __init__(self, sampler: HFStreamTokenSampler, batch_size: int, prefetch_batches: int) -> None:
         self.sampler = sampler
         self.batch_size = batch_size
         self.prefetch_batches = max(1, int(prefetch_batches))
@@ -549,7 +488,7 @@ def unwrap_model(model: nn.Module) -> nn.Module:
 
 def estimate_loss(
     model: nn.Module,
-    sampler,
+    sampler: HFStreamTokenSampler,
     eval_iters: int,
     batch_size: int,
     device: torch.device,
@@ -564,9 +503,9 @@ def estimate_loss(
     )
     with torch.no_grad():
         for _ in range(eval_iters):
-            x_np, y_np = sampler.sample_batch_arrays(batch_size)
-            x = torch.from_numpy(x_np).to(device, non_blocking=True)
-            y = torch.from_numpy(y_np).to(device, non_blocking=True)
+            x, y = sampler.sample_batch(batch_size)
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
             with autocast_ctx:
                 _, loss = model(x, y)
             losses.append(float(loss.item()))
@@ -691,39 +630,36 @@ def to_basic_types(obj):
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Train a ~100M GPT on XPU/CUDA/CPU using token shards.")
-    p.add_argument("--data-dir", type=Path, default=Path("data/tokens"))
-    p.add_argument("--hf-dataset", type=str, default=None,
-                   help="Hugging Face dataset name/path. If set, use HF streaming instead of --data-dir shards.")
-    p.add_argument("--hf-name", type=str, default=None, help="HF dataset config/subset name (optional).")
-    p.add_argument("--hf-train-split", type=str, default="train", help="HF split for training (streaming).")
-    p.add_argument("--hf-val-split", type=str, default="validation",
-                   help="HF split for validation (streaming). Use 'none' to disable.")
-    p.add_argument("--hf-token-field", type=str, default="input_ids", help="Field name for pre-tokenized ids.")
-    p.add_argument("--hf-text-field", type=str, default="text", help="Field name for raw text (if tokenizing).")
-    p.add_argument("--hf-tokenizer", type=str, default=None,
-                   help="Tokenizer name/path for on-the-fly tokenization (requires transformers).")
-    p.add_argument("--hf-cache-dir", type=Path, default=None, help="HF datasets cache dir (optional).")
-    p.add_argument("--hf-shuffle-buffer", type=int, default=10000,
-                   help="Streaming shuffle buffer (0 disables). Larger improves randomness but uses more RAM.")
-    p.add_argument("--hf-trust-remote-code", action="store_true",
-                   help="Pass trust_remote_code=True to datasets.load_dataset when supported.")
-    p.add_argument("--vocab-size", type=int, default=None,
-                   help="Vocab size override (required for --hf-dataset unless meta.json exists).")
+    p = argparse.ArgumentParser(description="Train a ~100M GPT on XPU/CUDA/CPU using HF streaming data.")
+    p.add_argument("--data-dir", type=Path, default=Path("data/tokens"), help=argparse.SUPPRESS)
+    p.add_argument("--tokenizer", type=Path, default=Path("tokenizer.json"))
+    p.add_argument("--hf-dataset", type=str, default="allenai/c4")
+    p.add_argument("--hf-config", type=str, default="zh")
+    p.add_argument("--hf-train-split", type=str, default="train")
+    p.add_argument("--hf-val-split", type=str, default="validation")
+    p.add_argument("--hf-text-field", type=str, default="text")
+    p.add_argument("--stream-shuffle-buffer", type=int, default=50_000)
+    p.add_argument("--encode-batch-size", type=int, default=256)
+    p.add_argument("--stream-buffer-tokens", type=int, default=1_000_000)
+    p.add_argument("--min-chars", type=int, default=1)
+    p.add_argument("--max-chars", type=int, default=20_000)
+    p.add_argument("--bos-token", type=str, default=None)
+    p.add_argument("--eos-token", type=str, default="</s>")
+
     p.add_argument("--out-dir", type=Path, default=Path("checkpoints/gpt100m"))
     p.add_argument("--device", type=str, default="auto", choices=["auto", "xpu", "cuda", "cpu"])
     p.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp16", "fp32"])
     p.add_argument("--compile", action="store_true")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--resume", type=Path, default=None)
-    p.add_argument("--val-ratio", type=float, default=0.02)
+    p.add_argument("--val-ratio", type=float, default=0.02, help="<=0 disables val evaluation")
     p.add_argument("--gradient-checkpointing", action="store_true")
     p.add_argument("--oom-auto-reduce", action="store_true")
     p.add_argument("--min-batch-size", type=int, default=1)
     p.add_argument("--prefetch-batches", type=int, default=16)
-    p.add_argument("--shards-per-batch", type=int, default=1)
-    p.add_argument("--ram-cache-gb", type=float, default=0.0)
-    p.add_argument("--random-sample", action="store_true", help="Disable contiguous-window batch sampling")
+    p.add_argument("--shards-per-batch", type=int, default=1, help=argparse.SUPPRESS)
+    p.add_argument("--ram-cache-gb", type=float, default=0.0, help=argparse.SUPPRESS)
+    p.add_argument("--random-sample", action="store_true", help="Sample random windows from stream buffer")
 
     p.add_argument("--seq-len", type=int, default=2048)
     p.add_argument("--n-layer", type=int, default=14)
@@ -755,46 +691,6 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    use_hf = args.hf_dataset is not None
-
-    vocab_size = None
-    data_meta = None
-    meta_path = args.data_dir / "meta.json"
-    if meta_path.exists():
-        try:
-            data_meta = json.loads(meta_path.read_text(encoding="utf-8"))
-            vocab_size = int(data_meta.get("vocab_size", 0)) or None
-        except Exception:
-            data_meta = None
-
-    if use_hf:
-        if args.vocab_size is not None:
-            vocab_size = int(args.vocab_size)
-        if vocab_size is None:
-            raise ValueError(
-                "When using --hf-dataset, please provide --vocab-size "
-                "(or keep a meta.json under --data-dir with vocab_size)."
-            )
-    else:
-        if data_meta is None:
-            raise FileNotFoundError(
-                f"meta.json not found under {args.data_dir}. "
-                "Either provide token shards with meta.json, or use --hf-dataset for streaming."
-            )
-        vocab_size = int(data_meta["vocab_size"])
-
-    cfg = GPTConfig(
-        vocab_size=int(vocab_size),
-        block_size=args.seq_len,
-        n_layer=args.n_layer,
-        n_head=args.n_head,
-        n_embd=args.n_embd,
-        ffn_mult=args.ffn_mult,
-        dropout=args.dropout,
-        bias=args.bias,
-        tie_embeddings=not args.no_tie_embeddings,
-    )
-
     runtime_device_type = resolve_device_type(args.device)
     ddp, rank, world_size, local_rank = setup_distributed(runtime_device_type)
     is_master = rank == 0
@@ -810,69 +706,68 @@ def main() -> None:
         amp_dtype = torch.bfloat16
     elif args.dtype == "fp16":
         amp_dtype = torch.float16
+    hf_config = args.hf_config.strip() if args.hf_config is not None else None
+    if hf_config == "":
+        hf_config = None
 
-    if use_hf:
-        train_sampler = HFStreamingTokenSampler(
-            dataset=args.hf_dataset,
-            name=args.hf_name,
-            split=args.hf_train_split,
-            seq_len=args.seq_len,
-            token_field=args.hf_token_field,
-            text_field=args.hf_text_field,
-            tokenizer_name_or_path=args.hf_tokenizer,
-            shuffle_buffer=args.hf_shuffle_buffer,
-            seed=args.seed,
-            rank=rank,
-            world_size=world_size,
-            cache_dir=args.hf_cache_dir,
-            trust_remote_code=args.hf_trust_remote_code,
-        )
-        val_sampler = None
-        if args.hf_val_split and str(args.hf_val_split).lower() not in {"none", "null", ""}:
-            try:
-                val_sampler = HFStreamingTokenSampler(
-                    dataset=args.hf_dataset,
-                    name=args.hf_name,
-                    split=args.hf_val_split,
-                    seq_len=args.seq_len,
-                    token_field=args.hf_token_field,
-                    text_field=args.hf_text_field,
-                    tokenizer_name_or_path=args.hf_tokenizer,
-                    shuffle_buffer=max(0, args.hf_shuffle_buffer // 4),
-                    seed=args.seed + 1,
-                    rank=rank,
-                    world_size=world_size,
-                    cache_dir=args.hf_cache_dir,
-                    trust_remote_code=args.hf_trust_remote_code,
-                )
-            except Exception as e:
-                if is_master:
-                    print(f"[warn] could not create val sampler from split='{args.hf_val_split}': {e}")
-                val_sampler = None
-    else:
-        train_sampler = TokenShardSampler(
-            args.data_dir,
-            split="train",
-            seq_len=args.seq_len,
-            val_ratio=args.val_ratio,
-            shards_per_batch=args.shards_per_batch,
-            contiguous_batch=not args.random_sample,
-            ram_cache_gb=args.ram_cache_gb,
-        )
-        val_sampler = None
-        if args.val_ratio > 0.0:
-            try:
-                val_sampler = TokenShardSampler(
-                    args.data_dir,
-                    split="val",
-                    seq_len=args.seq_len,
-                    val_ratio=args.val_ratio,
-                    shards_per_batch=max(1, args.shards_per_batch),
-                    contiguous_batch=not args.random_sample,
-                    ram_cache_gb=max(0.0, args.ram_cache_gb * 0.25),
-                )
-            except ValueError:
-                val_sampler = None
+    train_sampler = HFStreamTokenSampler(
+        tokenizer_path=args.tokenizer,
+        dataset_name=args.hf_dataset,
+        dataset_config=hf_config,
+        split=args.hf_train_split,
+        text_field=args.hf_text_field,
+        seq_len=args.seq_len,
+        seed=args.seed,
+        rank=rank,
+        world_size=world_size,
+        encode_batch_size=args.encode_batch_size,
+        shuffle_buffer=args.stream_shuffle_buffer,
+        min_chars=args.min_chars,
+        max_chars=args.max_chars,
+        bos_token=args.bos_token,
+        eos_token=args.eos_token,
+        random_sample=args.random_sample,
+        stream_buffer_tokens=args.stream_buffer_tokens,
+    )
+    cfg = GPTConfig(
+        vocab_size=train_sampler.vocab_size,
+        block_size=args.seq_len,
+        n_layer=args.n_layer,
+        n_head=args.n_head,
+        n_embd=args.n_embd,
+        ffn_mult=args.ffn_mult,
+        dropout=args.dropout,
+        bias=args.bias,
+        tie_embeddings=not args.no_tie_embeddings,
+    )
+
+    val_sampler = None
+    if args.val_ratio > 0.0:
+        try:
+            val_sampler = HFStreamTokenSampler(
+                tokenizer_path=args.tokenizer,
+                dataset_name=args.hf_dataset,
+                dataset_config=hf_config,
+                split=args.hf_val_split,
+                text_field=args.hf_text_field,
+                seq_len=args.seq_len,
+                seed=args.seed + 1,
+                rank=rank,
+                world_size=world_size,
+                encode_batch_size=args.encode_batch_size,
+                shuffle_buffer=0,
+                min_chars=args.min_chars,
+                max_chars=args.max_chars,
+                bos_token=args.bos_token,
+                eos_token=args.eos_token,
+                random_sample=False,
+                stream_buffer_tokens=max(args.seq_len * 8, args.stream_buffer_tokens // 4),
+            )
+        except Exception as e:
+            val_sampler = None
+            if is_master:
+                msg = str(e).strip().splitlines()[0] if str(e).strip() else "unknown error"
+                print(f"[warn] val stream init failed ({type(e).__name__}: {msg}); validation disabled.")
 
     model = GPT(cfg).to(device)
     model.set_gradient_checkpointing(args.gradient_checkpointing)
@@ -881,25 +776,10 @@ def main() -> None:
         print(f"device={device} ddp={ddp} world_size={world_size}")
         print(f"model params: {model_params:,}")
         print(f"grad_ckpt={args.gradient_checkpointing} oom_auto_reduce={args.oom_auto_reduce}")
-        if hasattr(train_sampler, "total_bytes") and getattr(train_sampler, "total_bytes", 0) > 0:
-            cached_gb = float(getattr(train_sampler, "cached_bytes", 0)) / (1024**3)
-            total_gb = float(getattr(train_sampler, "total_bytes", 0)) / (1024**3)
-            print(
-                f"data cache: {cached_gb:.2f}/{total_gb:.2f} GB in RAM "
-                f"(prefetch={args.prefetch_batches}, shards_per_batch={args.shards_per_batch})"
-            )
-        elif use_hf:
-            print(
-                f"data: hf://{args.hf_dataset} "
-                f"name={args.hf_name} train_split={args.hf_train_split} val_split={args.hf_val_split} "
-                f"token_field={args.hf_token_field} shuffle_buffer={args.hf_shuffle_buffer} "
-                f"(prefetch={args.prefetch_batches})"
-            )
-            total_gb = train_sampler.total_bytes / (1024**3)
-            print(
-                f"data cache: {cached_gb:.2f}/{total_gb:.2f} GB in RAM "
-                f"(prefetch={args.prefetch_batches}, shards_per_batch={args.shards_per_batch})"
-            )
+        print(
+            f"stream={args.hf_dataset}/{hf_config}:{args.hf_train_split} "
+            f"text_field={args.hf_text_field} prefetch={args.prefetch_batches}"
+        )
 
     model, compile_enabled = try_enable_compile(
         model=model,
