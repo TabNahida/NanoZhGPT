@@ -12,6 +12,38 @@ A tiny Chinese GPT implementation
   - Outputs per-chunk files to `chunks/` for resume.
   - Use `--chunk-files N` to group files per chunk, `--no-resume` to force rebuild.
 
+## Streaming C4 Tokenizer Trainer (HF)
+- Streams from Hugging Face `allenai/c4` directly (no chunk files).
+- Trains one tokenizer per language, then one global tokenizer.
+- Keeps only key outputs:
+  - `tokenizer_<lang>.json`
+  - `tokenizer_global.json`
+  - `stream_train_meta.json`
+- Enforces memory/disk budgets during training.
+
+Install deps:
+```powershell
+pip install datasets tokenizers psutil
+```
+
+Run:
+```powershell
+python tokenizer/train_c4_stream.py `
+  --dataset allenai/c4 `
+  --languages zh,en,de `
+  --split train `
+  --out-dir tokenizer/c4_stream `
+  --vocab-size 50000 `
+  --global-vocab-size 50000 `
+  --memory-budget-gb 50 `
+  --disk-budget-gb 20
+```
+
+Notes:
+- `--languages all` can train every config under `allenai/c4` (very expensive).
+- `--max-docs-per-lang` can limit sampled docs for faster pilot runs.
+- Default cache is `tokenizer/c4_stream/_hf_cache`; add `--keep-cache` to keep it after training.
+
 ## LLM Pretrain (XPU)
 
 ### 1) Prepare token shards (json/json.gz -> binary)
