@@ -12,9 +12,17 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
+import torch.nn.functional as F
 from tokenizers import Tokenizer
 
 from train_xpu import GPT, GPTConfig, resolve_device_type
+
+try:
+    from safetensors import safe_open
+    from safetensors.torch import load_file as load_safetensors_file
+except Exception:
+    safe_open = None
+    load_safetensors_file = None
 
 
 def load_env(path: Path) -> Dict[str, str]:
@@ -112,6 +120,39 @@ def choose_eval_dtype(
     return torch.bfloat16, "bf16"
 
 
+def choose_model_dtype(
+    dtype_arg: str,
+    amp_dtype: Optional[torch.dtype],
+    device: torch.device,
+) -> Tuple[Optional[torch.dtype], str]:
+    if device.type not in {"cuda", "xpu"}:
+        return None, "fp32"
+
+    if dtype_arg == "auto":
+        if amp_dtype == torch.float16:
+            return torch.float16, "fp16"
+        if amp_dtype == torch.bfloat16:
+            return torch.bfloat16, "bf16"
+        return None, "fp32"
+
+    dtype = parse_dtype_name(dtype_arg)
+    if dtype is None:
+        return None, "fp32"
+    if dtype == torch.float16:
+        return torch.float16, "fp16"
+    return torch.bfloat16, "bf16"
+
+
+def maybe_autocast(device: torch.device, amp_dtype: Optional[torch.dtype]):
+    if amp_dtype is not None and device.type in {"cuda", "xpu"}:
+        return torch.autocast(device_type=device.type, dtype=amp_dtype)
+    return nullcontext()
+
+
+def is_safetensors_path(path: Path) -> bool:
+    return path.suffix.lower() == ".safetensors"
+
+
 def get_checkpoint_paths(
     checkpoints_dir: Path,
     pattern: str,
@@ -119,7 +160,7 @@ def get_checkpoint_paths(
     max_checkpoints: int,
 ) -> List[Path]:
     paths = [Path(p) for p in glob.glob(str(checkpoints_dir / pattern))]
-    ckpt_re = re.compile(r"ckpt_(\d+)\.pt$")
+    ckpt_re = re.compile(r"ckpt_(\d+)\.(?:pt|safetensors)$")
 
     def sort_key(p: Path) -> Tuple[int, str]:
         m = ckpt_re.search(p.name)
@@ -130,9 +171,20 @@ def get_checkpoint_paths(
     paths = sorted(paths, key=sort_key)
 
     if include_last:
-        last_path = checkpoints_dir / "ckpt_last.pt"
-        if last_path.exists():
-            paths.append(last_path)
+        prefers_safe = "safetensors" in pattern
+        prefers_pt = pattern.endswith(".pt")
+        last_candidates: List[str]
+        if prefers_safe:
+            last_candidates = ["ckpt_last.safetensors", "ckpt_last.pt"]
+        elif prefers_pt:
+            last_candidates = ["ckpt_last.pt", "ckpt_last.safetensors"]
+        else:
+            last_candidates = ["ckpt_last.safetensors", "ckpt_last.pt"]
+        for name in last_candidates:
+            last_path = checkpoints_dir / name
+            if last_path.exists():
+                paths.append(last_path)
+                break
 
     deduped: List[Path] = []
     seen = set()
@@ -148,14 +200,82 @@ def get_checkpoint_paths(
     return deduped
 
 
+def read_safetensors_meta(ckpt_path: Path) -> Dict[str, object]:
+    if safe_open is None:
+        raise ImportError(
+            "safetensors is required to read .safetensors checkpoints. "
+            "Install with: pip install safetensors"
+        )
+
+    raw_meta: Dict[str, str] = {}
+    with safe_open(str(ckpt_path), framework="pt", device="cpu") as f:
+        raw_meta = dict(f.metadata() or {})
+
+    sidecar = ckpt_path.with_suffix(".meta.json")
+    sidecar_meta: Dict[str, object] = {}
+    if sidecar.exists():
+        sidecar_meta = json.loads(sidecar.read_text(encoding="utf-8"))
+
+    model_cfg_obj = sidecar_meta.get("model_config")
+    model_cfg_raw = raw_meta.get("model_config")
+    if model_cfg_raw:
+        model_cfg_obj = json.loads(model_cfg_raw)
+    if not isinstance(model_cfg_obj, dict):
+        raise ValueError(
+            f"missing model_config for {ckpt_path}. "
+            f"Expected safetensors metadata['model_config'] or {sidecar}."
+        )
+
+    iter_raw = raw_meta.get("iter_num", sidecar_meta.get("iter_num", -1))
+    try:
+        iter_num = int(iter_raw)
+    except (TypeError, ValueError):
+        iter_num = -1
+
+    train_dtype = str(raw_meta.get("train_dtype", sidecar_meta.get("train_dtype", "fp32")))
+    return {
+        "iter_num": iter_num,
+        "train_dtype": train_dtype,
+        "model_config": model_cfg_obj,
+    }
+
+
 def read_checkpoint_meta(ckpt_path: Path) -> Dict[str, object]:
+    if is_safetensors_path(ckpt_path):
+        return read_safetensors_meta(ckpt_path)
+
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     meta = {
         "iter_num": int(ckpt.get("iter_num", -1)),
         "train_dtype": str(ckpt.get("train_args", {}).get("dtype", "fp32")),
         "model_config": ckpt["model_config"],
     }
+    del ckpt
     return meta
+
+
+def load_checkpoint_for_eval(
+    ckpt_path: Path,
+) -> Tuple[Dict[str, torch.Tensor], Dict[str, object]]:
+    if is_safetensors_path(ckpt_path):
+        if load_safetensors_file is None:
+            raise ImportError(
+                "safetensors is required to load .safetensors checkpoints. "
+                "Install with: pip install safetensors"
+            )
+        meta = read_safetensors_meta(ckpt_path)
+        state_dict = load_safetensors_file(str(ckpt_path), device="cpu")
+        return state_dict, meta
+
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    state_dict = ckpt["model"]
+    meta = {
+        "iter_num": int(ckpt.get("iter_num", -1)),
+        "train_dtype": str(ckpt.get("train_args", {}).get("dtype", "fp32")),
+        "model_config": ckpt["model_config"],
+    }
+    del ckpt
+    return state_dict, meta
 
 
 def read_tokens_meta(path: Path) -> Dict[str, object]:
@@ -282,10 +402,68 @@ def build_eval_dataset(
 
 
 def ckpt_iter_from_name(path: Path, fallback: int) -> int:
-    m = re.search(r"ckpt_(\d+)\.pt$", path.name)
+    m = re.search(r"ckpt_(\d+)\.(?:pt|safetensors)$", path.name)
     if not m:
         return fallback
     return int(m.group(1))
+
+
+def is_oom_error(err: BaseException) -> bool:
+    msg = str(err).lower()
+    keys = ["out of memory", "not enough memory", "oom", "cannot allocate memory", "can't allocate memory"]
+    return any(k in msg for k in keys)
+
+
+def clear_device_cache(device: torch.device) -> None:
+    if device.type == "xpu":
+        torch.xpu.empty_cache()
+    elif device.type == "cuda":
+        torch.cuda.empty_cache()
+
+
+def compute_eval_loss(
+    model: GPT,
+    xb: torch.Tensor,
+    yb: torch.Tensor,
+    loss_chunk_tokens: int,
+) -> torch.Tensor:
+    if loss_chunk_tokens <= 0:
+        _, loss = model(xb, yb)
+        if loss is None:
+            raise RuntimeError("model returned no loss when targets were provided")
+        return loss
+
+    bsz, seqlen = xb.shape
+    if seqlen > model.cfg.block_size:
+        raise ValueError(f"seqlen {seqlen} > block_size {model.cfg.block_size}")
+
+    pos = torch.arange(0, seqlen, device=xb.device, dtype=torch.long)
+    hidden = model.wte(xb) + model.wpe(pos)[None, :, :]
+    hidden = model.drop(hidden)
+    for block in model.h:
+        hidden = block(hidden)
+    hidden = model.ln_f(hidden)
+
+    total = torch.zeros((), device=hidden.device, dtype=torch.float32)
+    total_tokens = 0
+    step = max(1, int(loss_chunk_tokens))
+    for start in range(0, seqlen, step):
+        h = hidden[:, start : start + step, :]
+        t = yb[:, start : start + step]
+        logits = model.lm_head(h)
+        chunk_sum = F.cross_entropy(
+            logits.reshape(-1, logits.size(-1)),
+            t.reshape(-1),
+            reduction="sum",
+        )
+        total += chunk_sum.float()
+        total_tokens += int(t.numel())
+        del logits
+
+    del hidden
+    if total_tokens <= 0:
+        raise ValueError("empty loss token count")
+    return total / float(total_tokens)
 
 
 def evaluate_one_checkpoint(
@@ -295,36 +473,63 @@ def evaluate_one_checkpoint(
     batch_size: int,
     device: torch.device,
     amp_dtype: Optional[torch.dtype],
+    model_dtype: Optional[torch.dtype],
+    loss_chunk_tokens: int,
+    oom_auto_reduce: bool,
 ) -> Dict[str, object]:
     t0 = time.time()
-    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    state_dict, meta = load_checkpoint_for_eval(ckpt_path)
 
-    model_cfg = GPTConfig(**ckpt["model_config"])
-    model = GPT(model_cfg).to(device)
-    model.load_state_dict(ckpt["model"], strict=True)
+    model_cfg = GPTConfig(**meta["model_config"])
+    model = GPT(model_cfg)
+    if model_dtype is not None:
+        model = model.to(device=device, dtype=model_dtype)
+    else:
+        model = model.to(device)
+    model.load_state_dict(state_dict, strict=True)
+    del state_dict
     model.eval()
-
-    use_autocast = amp_dtype is not None and device.type in {"cuda", "xpu"}
-    autocast_ctx = (
-        torch.autocast(device_type=device.type, dtype=amp_dtype) if use_autocast else nullcontext()
-    )
 
     total_loss = 0.0
     total_rows = 0
-    with torch.no_grad():
-        for i in range(0, x.size(0), batch_size):
-            xb = x[i : i + batch_size].to(device, non_blocking=True)
-            yb = y[i : i + batch_size].to(device, non_blocking=True)
-            with autocast_ctx:
-                _, loss = model(xb, yb)
-            rows = int(xb.size(0))
-            total_loss += float(loss.item()) * rows
-            total_rows += rows
+    current_batch_size = max(1, int(batch_size))
+    oom_retries = 0
+    with torch.inference_mode():
+        i = 0
+        while i < x.size(0):
+            try:
+                xb = x[i : i + current_batch_size].to(device, non_blocking=True)
+                yb = y[i : i + current_batch_size].to(device, non_blocking=True)
+                with maybe_autocast(device=device, amp_dtype=amp_dtype):
+                    loss = compute_eval_loss(
+                        model=model,
+                        xb=xb,
+                        yb=yb,
+                        loss_chunk_tokens=loss_chunk_tokens,
+                    )
+                rows = int(xb.size(0))
+                total_loss += float(loss.item()) * rows
+                total_rows += rows
+                i += rows
+                del xb
+                del yb
+                del loss
+            except RuntimeError as e:
+                if not (oom_auto_reduce and is_oom_error(e) and current_batch_size > 1):
+                    raise
+                old_bs = current_batch_size
+                current_batch_size = max(1, current_batch_size // 2)
+                oom_retries += 1
+                clear_device_cache(device)
+                print(
+                    f"[warn] OOM during eval on {ckpt_path.name}, "
+                    f"reduce batch_size: {old_bs} -> {current_batch_size}"
+                )
 
     val_loss = total_loss / max(1, total_rows)
     ppl = math.exp(min(val_loss, 30.0))
 
-    iter_num = int(ckpt.get("iter_num", -1))
+    iter_num = int(meta.get("iter_num", -1))
     iter_num = ckpt_iter_from_name(ckpt_path, fallback=iter_num)
 
     result = {
@@ -334,26 +539,31 @@ def evaluate_one_checkpoint(
         "val_loss": float(val_loss),
         "ppl": float(ppl),
         "eval_rows": int(total_rows),
+        "eval_batch_size": int(current_batch_size),
+        "oom_retries": int(oom_retries),
         "eval_seconds": float(time.time() - t0),
     }
 
     del model
-    del ckpt
-    if device.type == "xpu":
-        torch.xpu.empty_cache()
-    elif device.type == "cuda":
-        torch.cuda.empty_cache()
+    del meta
+    clear_device_cache(device)
     return result
 
 
 def load_model_for_generation(
     ckpt_path: Path,
     device: torch.device,
+    model_dtype: Optional[torch.dtype],
 ) -> Tuple[GPT, GPTConfig]:
-    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    cfg = GPTConfig(**ckpt["model_config"])
-    model = GPT(cfg).to(device)
-    model.load_state_dict(ckpt["model"], strict=True)
+    state_dict, meta = load_checkpoint_for_eval(ckpt_path)
+    cfg = GPTConfig(**meta["model_config"])
+    model = GPT(cfg)
+    if model_dtype is not None:
+        model = model.to(device=device, dtype=model_dtype)
+    else:
+        model = model.to(device)
+    model.load_state_dict(state_dict, strict=True)
+    del state_dict
     model.eval()
     return model, cfg
 
@@ -375,16 +585,12 @@ def generate_sample(
         raise ValueError("prompt produced 0 tokens; please provide a non-empty prompt")
 
     ids: List[int] = list(prompt_ids)
-    use_autocast = amp_dtype is not None and device.type in {"cuda", "xpu"}
-    autocast_ctx = (
-        torch.autocast(device_type=device.type, dtype=amp_dtype) if use_autocast else nullcontext()
-    )
 
-    with torch.no_grad():
+    with torch.inference_mode():
         for _ in range(max_new_tokens):
             idx = ids[-cfg.block_size :]
             x = torch.tensor([idx], dtype=torch.long, device=device)
-            with autocast_ctx:
+            with maybe_autocast(device=device, amp_dtype=amp_dtype):
                 logits, _ = model(x)
             next_logits = logits[0, -1, :]
 
@@ -423,6 +629,8 @@ def write_csv(path: Path, rows: Sequence[Dict[str, object]]) -> None:
         "val_loss",
         "ppl",
         "eval_rows",
+        "eval_batch_size",
+        "oom_retries",
         "eval_seconds",
     ]
     with path.open("w", encoding="utf-8", newline="") as f:
@@ -454,9 +662,27 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--encode-batch-size", type=int, default=256)
     p.add_argument("--min-chars", type=int, default=1)
     p.add_argument("--max-chars", type=int, default=20000)
-    p.add_argument("--batch-size", type=int, default=2)
+    p.add_argument("--batch-size", type=int, default=1)
     p.add_argument("--device", type=str, default="auto", choices=["auto", "xpu", "cuda", "cpu"])
     p.add_argument("--dtype", type=str, default="auto", choices=["auto", "bf16", "fp16", "fp32"])
+    p.add_argument(
+        "--model-dtype",
+        type=str,
+        default="auto",
+        choices=["auto", "bf16", "fp16", "fp32"],
+        help="weights dtype on device for eval; auto follows --dtype on XPU/CUDA",
+    )
+    p.add_argument(
+        "--loss-chunk-tokens",
+        type=int,
+        default=0,
+        help=">0 enables chunked LM loss over sequence dim to reduce peak logits memory",
+    )
+    p.add_argument(
+        "--oom-auto-reduce",
+        action="store_true",
+        help="auto reduce eval batch size by half on OOM",
+    )
 
     p.add_argument("--sample-prompt", type=str, default="今天天气不错，我们来聊聊人工智能。")
     p.add_argument("--sample-max-new-tokens", type=int, default=80)
@@ -500,6 +726,7 @@ def main() -> None:
 
     device = resolve_device(args.device)
     amp_dtype, amp_name = choose_eval_dtype(args.dtype, train_dtype, device)
+    model_dtype, model_dtype_name = choose_model_dtype(args.model_dtype, amp_dtype, device)
 
     val_files = expand_data_files(val_glob)
     if not val_files:
@@ -530,7 +757,17 @@ def main() -> None:
         f"docs_read={ds_stats['docs_read']} docs_used={ds_stats['docs_used']} stream_tokens={ds_stats['stream_tokens']} "
         f"text_field={text_field!r} bos_id={bos_id} eos_id={eos_id}"
     )
-    print(f"device={device} eval_dtype={amp_name} checkpoints={len(checkpoint_paths)}")
+    has_pt = any(p.suffix.lower() == ".pt" for p in checkpoint_paths)
+    if has_pt:
+        print(
+            "[hint] .pt checkpoint contains optimizer states. "
+            "For eval-only loading, export to .safetensors and set --checkpoint-pattern ckpt_*.safetensors"
+        )
+    print(
+        f"device={device} eval_dtype={amp_name} model_dtype={model_dtype_name} "
+        f"loss_chunk_tokens={args.loss_chunk_tokens} oom_auto_reduce={args.oom_auto_reduce} "
+        f"checkpoints={len(checkpoint_paths)}"
+    )
 
     results: List[Dict[str, object]] = []
     samples: List[Dict[str, object]] = []
@@ -544,16 +781,20 @@ def main() -> None:
             batch_size=args.batch_size,
             device=device,
             amp_dtype=amp_dtype,
+            model_dtype=model_dtype,
+            loss_chunk_tokens=args.loss_chunk_tokens,
+            oom_auto_reduce=args.oom_auto_reduce,
         )
         results.append(result)
         print(
             f"[{idx:03d}/{len(checkpoint_paths):03d}] {result['name']} "
             f"iter={result['iter_num']} val_loss={result['val_loss']:.4f} ppl={result['ppl']:.4f} "
-            f"time={result['eval_seconds']:.1f}s"
+            f"time={result['eval_seconds']:.1f}s bs={result['eval_batch_size']} "
+            f"oom_retries={result['oom_retries']}"
         )
 
         if args.sample_each:
-            model, cfg = load_model_for_generation(ckpt_path, device)
+            model, cfg = load_model_for_generation(ckpt_path, device, model_dtype=model_dtype)
             sample = generate_sample(
                 model=model,
                 cfg=cfg,
@@ -570,17 +811,14 @@ def main() -> None:
             samples.append(sample)
             print(f"[sample:{ckpt_path.name}] {sample['completion_text']}")
             del model
-            if device.type == "xpu":
-                torch.xpu.empty_cache()
-            elif device.type == "cuda":
-                torch.cuda.empty_cache()
+            clear_device_cache(device)
 
     results_sorted = sorted(results, key=lambda r: float(r["val_loss"]))
     best = results_sorted[0]
     best_ckpt = Path(str(best["checkpoint"]))
 
     if not args.sample_each:
-        model, cfg = load_model_for_generation(best_ckpt, device)
+        model, cfg = load_model_for_generation(best_ckpt, device, model_dtype=model_dtype)
         sample = generate_sample(
             model=model,
             cfg=cfg,
@@ -597,10 +835,7 @@ def main() -> None:
         samples.append(sample)
         print(f"[sample:best={best_ckpt.name}] {sample['completion_text']}")
         del model
-        if device.type == "xpu":
-            torch.xpu.empty_cache()
-        elif device.type == "cuda":
-            torch.cuda.empty_cache()
+        clear_device_cache(device)
 
     elapsed = time.time() - t_all
     print(
@@ -624,6 +859,9 @@ def main() -> None:
         "eos_id": eos_id,
         "device": str(device),
         "eval_dtype": amp_name,
+        "model_dtype": model_dtype_name,
+        "loss_chunk_tokens": int(args.loss_chunk_tokens),
+        "oom_auto_reduce": bool(args.oom_auto_reduce),
         "dataset_stats": ds_stats,
         "num_checkpoints": len(results),
         "best_checkpoint": best,
