@@ -444,26 +444,25 @@ def compute_eval_loss(
         hidden = block(hidden)
     hidden = model.ln_f(hidden)
 
-    total = torch.zeros((), device=hidden.device, dtype=torch.float32)
-    total_tokens = 0
+    vocab_size = int(model.lm_head.out_features)
+    logits = torch.empty((bsz, seqlen, vocab_size), device=hidden.device, dtype=hidden.dtype)
     step = max(1, int(loss_chunk_tokens))
     for start in range(0, seqlen, step):
         h = hidden[:, start : start + step, :]
-        t = yb[:, start : start + step]
-        logits = model.lm_head(h)
-        chunk_sum = F.cross_entropy(
-            logits.reshape(-1, logits.size(-1)),
-            t.reshape(-1),
-            reduction="sum",
-        )
-        total += chunk_sum.float()
-        total_tokens += int(t.numel())
-        del logits
+        end = start + h.size(1)
+        logits[:, start:end, :] = model.lm_head(h)
 
     del hidden
-    if total_tokens <= 0:
-        raise ValueError("empty loss token count")
-    return total / float(total_tokens)
+    if logits.size(1) <= 0:
+        raise ValueError("empty logits sequence")
+
+    # Keep CE in fp32 for stability under autocast/bf16/fp16 eval.
+    loss = F.cross_entropy(
+        logits.float().reshape(-1, logits.size(-1)),
+        yb.reshape(-1),
+    )
+    del logits
+    return loss
 
 
 def evaluate_one_checkpoint(
@@ -676,7 +675,7 @@ def parse_args() -> argparse.Namespace:
         "--loss-chunk-tokens",
         type=int,
         default=0,
-        help=">0 enables chunked LM loss over sequence dim to reduce peak logits memory",
+        help=">0 runs lm_head by chunks and computes one final LM loss from merged logits",
     )
     p.add_argument(
         "--oom-auto-reduce",
