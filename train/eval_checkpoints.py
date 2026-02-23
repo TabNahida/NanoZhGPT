@@ -476,6 +476,7 @@ def evaluate_one_checkpoint(
     model_dtype: Optional[torch.dtype],
     loss_chunk_tokens: int,
     oom_auto_reduce: bool,
+    nan_retry_fp32: bool,
 ) -> Dict[str, object]:
     t0 = time.time()
     state_dict, meta = load_checkpoint_for_eval(ckpt_path)
@@ -494,18 +495,24 @@ def evaluate_one_checkpoint(
     total_rows = 0
     current_batch_size = max(1, int(batch_size))
     oom_retries = 0
+    fp32_retries = 0
+    eval_amp_dtype = amp_dtype
     with torch.inference_mode():
         i = 0
         while i < x.size(0):
             try:
                 xb = x[i : i + current_batch_size].to(device, non_blocking=True)
                 yb = y[i : i + current_batch_size].to(device, non_blocking=True)
-                with maybe_autocast(device=device, amp_dtype=amp_dtype):
+                with maybe_autocast(device=device, amp_dtype=eval_amp_dtype):
                     loss = compute_eval_loss(
                         model=model,
                         xb=xb,
                         yb=yb,
                         loss_chunk_tokens=loss_chunk_tokens,
+                    )
+                if not bool(torch.isfinite(loss).item()):
+                    raise FloatingPointError(
+                        f"non-finite eval loss at row={i} ckpt={ckpt_path.name}"
                     )
                 rows = int(xb.size(0))
                 total_loss += float(loss.item()) * rows
@@ -514,6 +521,24 @@ def evaluate_one_checkpoint(
                 del xb
                 del yb
                 del loss
+            except FloatingPointError as e:
+                if (
+                    nan_retry_fp32
+                    and fp32_retries == 0
+                    and (eval_amp_dtype is not None or model_dtype is not None)
+                ):
+                    print(
+                        f"[warn] {e}; retry {ckpt_path.name} with fp32 forward for stable eval."
+                    )
+                    model = model.to(dtype=torch.float32)
+                    eval_amp_dtype = None
+                    fp32_retries += 1
+                    total_loss = 0.0
+                    total_rows = 0
+                    i = 0
+                    clear_device_cache(device)
+                    continue
+                raise
             except RuntimeError as e:
                 if not (oom_auto_reduce and is_oom_error(e) and current_batch_size > 1):
                     raise
@@ -541,6 +566,7 @@ def evaluate_one_checkpoint(
         "eval_rows": int(total_rows),
         "eval_batch_size": int(current_batch_size),
         "oom_retries": int(oom_retries),
+        "fp32_retries": int(fp32_retries),
         "eval_seconds": float(time.time() - t0),
     }
 
@@ -631,6 +657,7 @@ def write_csv(path: Path, rows: Sequence[Dict[str, object]]) -> None:
         "eval_rows",
         "eval_batch_size",
         "oom_retries",
+        "fp32_retries",
         "eval_seconds",
     ]
     with path.open("w", encoding="utf-8", newline="") as f:
@@ -682,6 +709,11 @@ def parse_args() -> argparse.Namespace:
         "--oom-auto-reduce",
         action="store_true",
         help="auto reduce eval batch size by half on OOM",
+    )
+    p.add_argument(
+        "--nan-retry-fp32",
+        action="store_true",
+        help="retry a checkpoint in fp32 when non-finite loss is detected",
     )
 
     p.add_argument("--sample-prompt", type=str, default="今天天气不错，我们来聊聊人工智能。")
@@ -766,6 +798,7 @@ def main() -> None:
     print(
         f"device={device} eval_dtype={amp_name} model_dtype={model_dtype_name} "
         f"loss_chunk_tokens={args.loss_chunk_tokens} oom_auto_reduce={args.oom_auto_reduce} "
+        f"nan_retry_fp32={args.nan_retry_fp32} "
         f"checkpoints={len(checkpoint_paths)}"
     )
 
@@ -784,13 +817,14 @@ def main() -> None:
             model_dtype=model_dtype,
             loss_chunk_tokens=args.loss_chunk_tokens,
             oom_auto_reduce=args.oom_auto_reduce,
+            nan_retry_fp32=args.nan_retry_fp32,
         )
         results.append(result)
         print(
             f"[{idx:03d}/{len(checkpoint_paths):03d}] {result['name']} "
             f"iter={result['iter_num']} val_loss={result['val_loss']:.4f} ppl={result['ppl']:.4f} "
             f"time={result['eval_seconds']:.1f}s bs={result['eval_batch_size']} "
-            f"oom_retries={result['oom_retries']}"
+            f"oom_retries={result['oom_retries']} fp32_retries={result['fp32_retries']}"
         )
 
         if args.sample_each:
@@ -862,6 +896,7 @@ def main() -> None:
         "model_dtype": model_dtype_name,
         "loss_chunk_tokens": int(args.loss_chunk_tokens),
         "oom_auto_reduce": bool(args.oom_auto_reduce),
+        "nan_retry_fp32": bool(args.nan_retry_fp32),
         "dataset_stats": ds_stats,
         "num_checkpoints": len(results),
         "best_checkpoint": best,
